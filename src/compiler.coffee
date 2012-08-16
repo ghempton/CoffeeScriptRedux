@@ -1,4 +1,4 @@
-{any, concat, concatMap, difference, divMod, foldl1, map, nub, owns, union} = require './functional-helpers'
+{any, concat, concatMap, difference, foldl1, map, nub, owns, union} = require './functional-helpers'
 {beingDeclared, usedAsExpression, envEnrichments} = require './helpers'
 CS = require './nodes'
 JS = require './js-nodes'
@@ -12,7 +12,7 @@ jsReserved = [
   'else', 'enum', 'export', 'extends', 'false', 'finally', 'for', 'function', 'if', 'implements',
   'import', 'in', 'instanceof', 'interface', 'let', 'native', 'new', 'null', 'package', 'private',
   'protected', 'public', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true', 'try',
-  'typeof', 'var', 'void', 'while', 'with', 'yield', 'arguments', 'eval'
+  'typeof', 'var', 'void', 'while', 'with', 'yield'
 ]
 
 
@@ -154,11 +154,6 @@ memberAccess = (e, member) ->
   if member in jsReserved or +member.toString()[0] in [0..9]
   then new JS.MemberExpression yes, (expr e), new JS.Literal member
   else new JS.MemberExpression no, (expr e), new JS.Identifier member
-
-dynamicMemberAccess = (e, index) ->
-  if (index.instanceof JS.Literal) and typeof index.value is 'string'
-  then memberAccess e, index.value
-  else new JS.MemberExpression yes, e, index
 
 
 helperNames = {}
@@ -355,44 +350,34 @@ class exports.Compiler
       params = []
       parentRef = genSym 'super'
       block = forceBlock block
-      if (name.instanceof JS.Identifier) and name.name in jsReserved
-        name = genSym name.name
 
-      if ctor?
-        # TODO: I'd really like to avoid searching for the constructor like this
-        for c, i in block.body when c.instanceof JS.FunctionDeclaration
-          ctorIndex = i
-          break
-        block.body.splice ctorIndex, 1, ctor
-      else
+      unless ctor?
         ctor = new JS.FunctionDeclaration name, [], new JS.BlockStatement []
-        ctorIndex = 0
-        block.body.unshift ctor
       ctor.id = name
       # handle external constructors
       if @ctor? and not @ctor.expression.instanceof CS.Functions
         ctorRef = genSym 'externalCtor'
         ctor.body.body.push makeReturn new JS.CallExpression (memberAccess ctorRef, 'apply'), [new JS.ThisExpression, new JS.Identifier 'arguments']
-        block.body.splice ctorIndex, 0, stmt new JS.AssignmentExpression '=', ctorRef, compile @ctor.expression
+        block.body.unshift stmt new JS.AssignmentExpression '=', ctorRef, compile @ctor.expression
+      block.body.unshift ctor
+      console.log(block.raw)
 
-      if @boundMembers.length > 0
+      if @boundMembers? and @boundMembers.length > 0
         instance = genSym 'instance'
-        for protoAssignOp in @boundMembers
-          memberName = protoAssignOp.assignee.data.toString()
-          ps = (genSym() for _ in protoAssignOp.expression.parameters)
+        for memberName in @boundMembers
           member = memberAccess new JS.ThisExpression, memberName
           protoMember = memberAccess (memberAccess name, 'prototype'), memberName
-          fn = new JS.FunctionExpression null, ps, new JS.BlockStatement [
-            makeReturn new JS.CallExpression (memberAccess protoMember, 'apply'), [instance, new JS.Identifier 'arguments']
+          fn = new JS.FunctionExpression null, [], new JS.BlockStatement [
+            stmt new JS.CallExpression (memberAccess protoMember, 'apply'), [instance, new JS.Identifier 'arguments']
           ]
           ctor.body.body.unshift stmt new JS.AssignmentExpression '=', member, fn
         ctor.body.body.unshift stmt new JS.AssignmentExpression '=', instance, new JS.ThisExpression
 
-      if parent?
-        params.push parentRef
-        args.push parent
-        block.body.unshift stmt helpers.extends name, parentRef
-      block.body.push new JS.ReturnStatement new JS.ThisExpression
+      # if parent?
+      #   params.push parentRef
+      #   args.push parent
+      #   block.body.unshift stmt helpers.extends name, parentRef
+      # block.body.push new JS.ReturnStatement new JS.ThisExpression
 
       rewriteThis = generateMutatingWalker ->
         if @instanceof JS.ThisExpression then name
@@ -400,7 +385,9 @@ class exports.Compiler
         else rewriteThis this
       rewriteThis block
 
-      iife = new JS.CallExpression (new JS.FunctionExpression null, params, block), args
+      parentExpr = if parent? then new JS.Identifier(parent.name) else memberAccess(new JS.Identifier('Ember'), 'Object')
+      console.log(parentExpr)
+      iife = new JS.CallExpression memberAccess(parentExpr, 'extend'), []
       if nameAssignee? then new JS.AssignmentExpression '=', nameAssignee, iife else iife
     ]
     [CS.Constructor, ({expression}) ->
@@ -478,7 +465,7 @@ class exports.Compiler
       new JS.ConditionalExpression condition, assignee, new JS.AssignmentExpression '=', assignee, expr expression
     ]
     [CS.FunctionApplication, ({function: fn, arguments: args}) -> new JS.CallExpression (expr fn), map args, expr]
-    [CS.NewOp, ({ctor, arguments: args}) -> new JS.NewExpression ctor, args]
+    [CS.NewOp, ({ctor, arguments: args}) -> new JS.CallExpression memberAccess(ctor, 'create'), []]
     [CS.HeregExp, ({expression}) ->
       args = [expression]
       if flags = (flag for flag in ['g', 'i', 'm', 'y'] when @flags[flag]).join ''
@@ -502,8 +489,11 @@ class exports.Compiler
     ]
     [CS.MemberAccessOp, ({expression}) -> memberAccess expression, @memberName]
     [CS.ProtoMemberAccessOp, ({expression}) -> memberAccess (memberAccess expression, 'prototype'), @memberName]
-    [CS.DynamicMemberAccessOp, ({expression, indexingExpr}) -> dynamicMemberAccess expression, indexingExpr]
-    [CS.DynamicProtoMemberAccessOp, ({expression, indexingExpr}) -> dynamicMemberAccess (memberAccess expression, 'prototype'), indexingExpr]
+    [CS.DynamicMemberAccessOp, ({expression, indexingExpr}) ->
+      if (indexingExpr.instanceof JS.Literal) and typeof indexingExpr.value is 'string'
+      then memberAccess expression, indexingExpr.value
+      else new JS.MemberExpression yes, expression, indexingExpr
+    ]
     [CS.SoakedMemberAccessOp, ({expression, inScope}) ->
       e = if needsCaching @expression then genSym 'cache' else expression
       condition = new JS.BinaryExpression '!=', (new JS.Literal null), e
@@ -664,15 +654,7 @@ class exports.Compiler
     generateSymbols = do ->
 
       generatedSymbols = {}
-      format = (pre, counter) ->
-        if pre
-          "#{pre}$#{counter or ''}"
-        else
-          if counter < 26
-            String.fromCharCode 0x61 + counter
-          else
-            [div, mod] = divMod counter, 26
-            (format pre, div - 1) + format pre, mod
+      format = (pre, counter) -> "#{pre}$#{counter or ''}"
 
       generateName = (node, {usedSymbols, nsCounters}) ->
         if owns generatedSymbols, node.uniqueId
@@ -717,5 +699,5 @@ class exports.Compiler
       jsAST = walk.call ast, (-> (rules[@className] ? defaultRule).apply this, arguments), [], [], options
       generateSymbols jsAST,
         declaredSymbols: []
-        usedSymbols: jsReserved[..]
+        usedSymbols: collectIdentifiers jsAST
         nsCounters: {}
